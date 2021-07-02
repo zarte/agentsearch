@@ -1,0 +1,519 @@
+package Worker
+
+import (
+    "github.com/henrylee2cn/surfer"
+   // "github.com/axgle/mahonia"
+    "io/ioutil"
+    "time"
+    "regexp"
+    "tcraw/Model"
+    "strings"
+    "tcraw/Logger"
+    "tcraw/Config"
+    "fmt"
+    "golang.org/x/net/html/charset"
+    "golang.org/x/text/transform"
+    "bufio"
+    "github.com/tebeka/selenium"
+    "github.com/tebeka/selenium/chrome"
+    "tcraw/Redis"
+    "github.com/ouqiang/goutil"
+    "net/http"
+    "io"
+    "net"
+    "encoding/json"
+    "strconv"
+    "tcraw/Fileop"
+	"os"
+)
+
+var RunPageNums int = 0
+var SuccessRunNums int = 0
+var SuccessChannel = make(chan bool)
+var RunPageNumsChannel = make(chan int)
+
+var Totalpagenums int = 0
+
+
+var chthreadnum = make(chan int)
+var totalchthread int
+
+var datereg *regexp.Regexp
+var yesterday int64
+
+var cookies []selenium.Cookie
+
+func ResetConfIni(){
+    owordarrlist = nil
+    osenswordarrlist = nil
+    Totalpagenums = 0
+    // Redis.Rediscleardb(1)
+
+
+}
+
+func Initargs() bool {
+    //dateregstr := `[\d]{4}\-[\d]{2}\-[\d]{2}`
+    dateregstr := `tails\(\'([\d]*)\'`
+    tdatereg,err := regexp.Compile(dateregstr)
+    if err != nil {
+        fmt.Println("create datereg fail")
+        return false
+    }
+    datereg = tdatereg
+
+    //前一天凌晨
+    nTime := time.Now()
+    //yesTime := nTime.AddDate(0,0,-1)
+    timeStr := nTime.Format("2006-01-02")
+    tt, _ := time.Parse("2006-01-02", timeStr)
+    yesterday = tt.Unix()
+
+
+    //清空redis缓存
+    Redis.Rediscleardb(1)
+    return true
+}
+
+
+
+
+func ThreadRun(topPageUrl []string) {
+    defer func() {
+        SuccessChannel <- true
+    }()
+    Logger.Debug("start main page...", topPageUrl[0])
+    RunPageNumsChannel <- 1
+
+   // testproxy("1","3")
+	html :=down("http://www.ip138.com/","")
+	fmt.Println(html)
+    Logger.Debug("end main page...", topPageUrl[0])
+}
+
+type ProxyIp struct {
+    Port          int             `json:"port"`
+    Host        string          `json:"host"`
+    Type        string          `json:"type"`
+    Country        string          `json:"country"`
+    From        string          `json:"from"`
+	Anonymity   string 			 `json:"anonymity"`
+}
+
+type Proxitem struct {
+    Url    string
+    Type   string
+    Port   string
+    Country string
+	Anonymity string
+}
+var Proxlist chan Proxitem
+
+func testproxy(ip string, prot string)  {
+
+    Proxlist = make(chan Proxitem,20)
+    chthreadnum = make(chan int)
+
+   totalnum := 0
+   // html := down("http://2019.ip138.com/ic.asp")
+   // proxyIp := map[string]interface{}{}
+   var proxyIp ProxyIp
+
+	//生成等待协程
+	for w := 1; w <= 10; w++ {
+		totalchthread++
+		go testproxychild(Proxlist)
+	}
+
+    if Fileop.Checkexist("./proxlist.data") {
+		f, err := os.OpenFile("./proxlist.data", os.O_RDONLY,0)  //打开文件
+		if err != nil {
+			fmt.Println(err)
+		}else{
+			defer f.Close()
+			reader := bufio.NewReader(f)
+			for {
+				line,_,err :=reader.ReadLine()
+				if err!=nil {
+					fmt.Println(err)
+					break
+				}else{
+					item := strings.Fields(string(line))
+					if len(item) < 4{
+						continue
+					}
+					var info Proxitem
+					info.Url = item[0]
+					info.Port = item[1]
+					info.Type = item[3]
+					info.Country = item[2]
+
+					if len(item)>4{
+						info.Anonymity = item[4]
+					}
+
+
+					totalnum++
+					Proxlist <- info
+				}
+			}
+		}
+	}else{
+		//获取代理列表
+		req, err := http.NewRequest("GET", "https://raw.githubusercontent.com/fate0/proxylist/master/proxy.list", nil)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		req.Header.Add("user-agent","Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/71.0.3578.98 Safari/537.36")
+		var resp *http.Response
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		defer resp.Body.Close()
+		//将请求结果的byte数组放到responseBytes中
+		reader := bufio.NewReader(resp.Body)
+
+		for {
+			line,_,err :=reader.ReadLine()
+			// bytes, err :=ioutil.ReadAll(resp.Body)
+			if err!=nil {
+				fmt.Println(err)
+				break
+			}else{
+				err :=json.Unmarshal(line, &proxyIp)
+
+				if err !=nil {
+					fmt.Println(err)
+				}else{
+					port := strconv.Itoa(proxyIp.Port)
+					if proxyIp.Host == ""  || port ==""{
+						continue
+					}
+
+
+					var info Proxitem
+					info.Url = proxyIp.Host
+					info.Port = port
+					info.Type = proxyIp.Type
+					info.Country = proxyIp.Country
+					info.Anonymity = proxyIp.Anonymity
+					totalnum++
+					Proxlist <- info
+				}
+			}
+		}
+	}
+
+
+    close(Proxlist)
+
+
+    //等待线程完成
+    //等待协程结束
+    var completenum int
+    completenum = 0
+    for {
+        _ =<- chthreadnum
+        completenum ++
+        if completenum >= totalchthread{
+            break
+        }
+    }
+    fmt.Println("totalnum is:",totalnum)
+}
+
+func testproxychild(list <- chan Proxitem)  {
+    defer func(){
+        chthreadnum <- 1
+    }()
+    for item := range list{
+            _, err := net.Dial("tcp",item.Url+":"+item.Port )
+            if err == nil {
+                //端口开放
+                fmt.Println(item.Url,"open")
+                Fileop.Fileoper.Adddata(item.Url,item.Port ,item.Country,item.Type,item.Anonymity)
+            }else{
+                fmt.Println(item.Url,"close")
+            }
+            /*
+			   if proxyIp["host"] == ""  || proxyIp["port"] ==""{
+				   continue
+			   }
+			   host := proxyIp["host"].(string)
+			   port := strconv.FormatFloat(proxyIp["port"].(float64),'E',-1,64)
+			   url := host+":"+ port
+			   _, err = net.Dial("tcp",url )
+			   if err == nil {
+				   //端口开放
+				   fmt.Println(proxyIp["host"],proxyIp["port"],"open")
+				   Logger.ToFile(proxyIp["host"],proxyIp["port"],proxyIp["country"],proxyIp["type"])
+			   }else{
+				  // fmt.Println(err)
+				   fmt.Println(proxyIp["port"],url,"close")
+			   }
+			   */
+    }
+}
+
+type SensiWord struct {
+    str    string
+    reg    *regexp.Regexp
+}
+var  osenswordarrlist [][]string
+//敏感词
+var  owordarrlist map[int][]SensiWord
+func GetWordList() map[int][]SensiWord {
+
+    if owordarrlist == nil {
+        owordarrlist  = make(map[int][]SensiWord)
+        tlist  :=  Model.GetWordList()
+
+        for _, item := range tlist {
+            twordarr :=strings.Split(item.Word, "、")
+
+            var cwordmap []SensiWord
+            for _, cword := range twordarr {
+                if strings.Trim(cword," ") == "" {
+                    continue
+                }
+                var tcword = ">([^<]*?)"+strings.Trim(cword," ")+"([^<]*?)<(/(^s|span)|^/)"
+                var tcnode SensiWord
+                tcnode.str = cword
+                treg,err := regexp.Compile(tcword)
+                if err != nil{
+                    Logger.Debug("reg err ...",err)
+                    tcnode.reg = nil
+                }else{
+                    tcnode.reg = treg
+                }
+
+
+                cwordmap = append(cwordmap,tcnode)
+            }
+            owordarrlist[item.CateId] = cwordmap
+        }
+    }
+    return owordarrlist
+}
+
+
+//下载并返回结果
+/**
+Proxy: "http://158.69.243.155:18887",
+ */
+func down(url string,proxy string) string {
+
+    surfer.SetPhantomJsFilePath(Config.ConfigValue.PJexepath)
+
+    var newheader http.Header
+
+    newheader = make(map[string][]string)
+
+    newheader.Add("user-agent","Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/71.0.3578.98 Safari/537.36")
+
+    resp, err := surfer.Download(&surfer.Request{
+        DownloaderID: 0,
+        Url: url,
+        Header: newheader,
+        DialTimeout : time.Second * time.Duration(Config.ConfigValue.DialTimeout),
+        ConnTimeout: time.Minute * time.Duration(Config.ConfigValue.ConnTimeout),
+        TryTimes : Config.ConfigValue.RetryTimes,
+        RedirectTimes : Config.ConfigValue.RedirectTimes,
+		Proxy: proxy,
+    })
+
+
+    if err != nil {
+        Logger.ToFile("get error[", url, "]", err)
+        return ""
+    }
+
+    defer resp.Body.Close()
+    //判断编码
+    reader := bufio.NewReader(resp.Body)
+    bytes, e := reader.Peek(1024)
+    if e != nil && e != io.EOF{
+        return ""
+    }
+    encodig, _, _ := charset.DetermineEncoding(bytes, "")
+
+    utf8Reader := transform.NewReader(resp.Body, encodig.NewDecoder())
+
+
+    body, err := ioutil.ReadAll(utf8Reader)
+
+    if err != nil {
+        Logger.Debug(err)
+        fmt.Println("down err03")
+        Logger.ToFile("get error[", url, "]", err)
+        return ""
+    } else {
+        return string(body)
+    }
+}
+
+//初始化一个selenium
+var Seleniumserver *selenium.Service
+func Getseleniumserver() bool {
+    opts := []selenium.ServiceOption{}
+
+    selenium.SetDebug(false)
+    server, err := selenium.NewChromeDriverService(Config.ConfigValue.SeleniumPath, Config.ConfigValue.Seleniumport, opts...)
+    if nil != err {
+        fmt.Println("start a chromedriver service falid", err.Error())
+        return false
+    }
+    Seleniumserver = server
+    return  true
+    //注意这里，server关闭之后，chrome窗口也会关闭
+   // defer service.Stop()
+}
+func Shutselenium()  {
+    Seleniumserver.Stop()
+    Seleniumserver = nil
+}
+
+
+func downbyselenium(url string, isMainPage bool ,initjs int) string {
+
+    if url == "" {
+        fmt.Println("url is empty")
+        return ""
+    }
+
+    // if Redis.RedisCheckKeyex("craw"+goutil.MD5(url),1) {
+    //     return ""
+    // }
+
+    if Redis.Redissetex("craw"+goutil.MD5(url), "1", 1) != nil {
+        return ""
+    }
+
+    fmt.Println("down ulr :", url)
+    Totalpagenums++
+    //链接本地的浏览器 chrome
+    caps := selenium.Capabilities{
+        "browserName": "chrome",
+    }
+    caps.SetLogLevel("driver", "OFF")
+
+    //禁止图片加载，加快渲染速度
+    imagCaps := map[string]interface{}{
+        "profile.managed_default_content_settings.images": 2,
+    }
+    chromeCaps := chrome.Capabilities{
+        Prefs: imagCaps,
+        Path:  "",
+        Args: []string{
+            "--log-level=3",
+            // "--headless", // 设置Chrome无头模式，在linux下运行，需要设置这个参数，否则会报错
+            "--no-sandbox",
+            "--disable-gpu",
+            "--blink-settings=imagesEnabled=false",
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36", // 模拟user-agent，防反爬
+        },
+    }
+    //以上是设置浏览器参数
+    caps.AddChrome(chromeCaps)
+
+    // 调起chrome浏览器
+    w_b1, err := selenium.NewRemote(caps, fmt.Sprintf("http://localhost:%d/wd/hub", Config.ConfigValue.Seleniumport))
+    if err != nil {
+        Logger.Debug("connect to the webDriver faild", err.Error())
+        return ""
+    }
+    defer w_b1.Quit()
+
+    w_b1.SetPageLoadTimeout(time.Duration(Config.ConfigValue.DialTimeout) * time.Second)
+    err = w_b1.Get(url)
+    if err != nil {
+        Logger.Debug("get page faild", err.Error())
+        return ""
+    }
+    cookies,_ = w_b1.GetCookies()
+
+    btn, err := w_b1.FindElement(selenium.ByCSSSelector, "#accountLogin")
+
+    if err != nil {
+        panic(err)
+    }
+    if err := btn.Click(); err != nil {
+        panic(err)
+    }
+    time.Sleep(time.Second * 5)
+
+    elem, err := w_b1.FindElement(selenium.ByCSSSelector, "#username")
+    if err != nil {
+        panic(err)
+    }
+    // Remove the boilerplate code already in the text box.
+    if err := elem.Clear(); err != nil {
+        panic(err)
+    }
+    err = elem.SendKeys(`ggzh2`)
+    if err != nil {
+        panic(err)
+    }
+
+    elem, err = w_b1.FindElement(selenium.ByCSSSelector, "#password")
+    if err != nil {
+        panic(err)
+    }
+    // Remove the boilerplate code already in the text box.
+    if err := elem.Clear(); err != nil {
+        panic(err)
+    }
+    time.Sleep(time.Second * 2)
+    err = elem.SendKeys(`123456`)
+    if err != nil {
+        panic(err)
+    }
+    if err != nil {
+        panic(err)
+    }
+    time.Sleep(time.Second * 3)
+
+
+    btn, err = w_b1.FindElement(selenium.ByXPATH, "//*[@id='loginForm']/div[5]/input")
+    if err != nil {
+        panic(err)
+        return ""
+    }
+    if err := btn.Submit(); err != nil {
+        panic(err)
+        return ""
+    }
+    time.Sleep(time.Second * 5)
+    btn, err = w_b1.FindElement(selenium.ByXPATH, `//*[@id="menu"]/li[2]/a`)
+    if err != nil {
+        panic(err)
+        return ""
+    }
+    if err := btn.Click(); err != nil {
+        panic(err)
+        return ""
+    }
+
+    time.Sleep(time.Second * 3)
+    btn, err = w_b1.FindElement(selenium.ByXPATH, `//*[@id="collapse-404645123563192320"]/div/ul/li[2]/a`)
+    if err != nil {
+        panic(err)
+        return ""
+    }
+    if err := btn.Click(); err != nil {
+        panic(err)
+        return ""
+    }
+
+    time.Sleep(time.Second * 3)
+    err = w_b1.SwitchFrame("mainFrame")
+    if err!=nil {
+        panic(err)
+        return ""
+    }
+    time.Sleep(time.Second * 30)
+    return ""
+}
